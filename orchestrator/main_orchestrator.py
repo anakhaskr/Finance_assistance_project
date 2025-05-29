@@ -37,23 +37,31 @@ class MainOrchestrator:
             # Step 2: Get market data
             market_data = await self.get_market_data()
             
-            # Step 3: Retrieve relevant context
+            # Step 3: Get scraped news data if query is news-related
+            news_data = []
+            earnings_data = []
+            if self._is_news_query(query_text):
+                news_data = await self.get_scraped_news()
+            if self._is_earnings_query(query_text):
+                earnings_data = await self.get_scraped_earnings()
+            
+            # Step 4: Retrieve relevant context
             context_chunks = await self.retrieve_context(query_text)
             
-            # Step 4: Synthesize response
+            # Step 5: Synthesize response with all data sources
             synthesis_response = await self.synthesize_response(
-                query_text, context_chunks, market_data
+                query_text, context_chunks, market_data, news_data, earnings_data
             )
             
             response_text = synthesis_response["response"]
             confidence = synthesis_response["confidence"]
             
-            # Step 5: Handle voice output if needed
+            # Step 6: Handle voice output if needed
             audio_file = None
             if request.mode == "voice":
                 audio_file = await self.generate_voice_response(response_text)
             
-            # Step 6: Check confidence and handle fallback
+            # Step 7: Check confidence and handle fallback
             if confidence < self.confidence_threshold:
                 fallback_msg = "I need more specific information to provide an accurate response. Could you please clarify your question?"
                 if request.mode == "voice":
@@ -73,6 +81,16 @@ class MainOrchestrator:
                 confidence=0.0,
                 status="error"
             )
+    
+    def _is_news_query(self, query: str) -> bool:
+        """Check if query is asking for news"""
+        news_keywords = ["news", "headlines", "latest", "breaking", "announcements", "reports"]
+        return any(keyword in query.lower() for keyword in news_keywords)
+    
+    def _is_earnings_query(self, query: str) -> bool:
+        """Check if query is asking for earnings"""
+        earnings_keywords = ["earnings", "quarterly", "results", "profit", "revenue", "eps"]
+        return any(keyword in query.lower() for keyword in earnings_keywords)
     
     async def process_voice_input(self, audio_file: str) -> str:
         """Process voice input through STT"""
@@ -95,6 +113,28 @@ class MainOrchestrator:
         except:
             return []
     
+    async def get_scraped_news(self) -> List[Dict]:
+        """Get scraped news from scraping agent"""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(f"{self.agents['scraping']}/scrape_news")
+                if response.status_code == 200:
+                    return response.json()["data"]
+                return []
+        except:
+            return []
+    
+    async def get_scraped_earnings(self) -> List[Dict]:
+        """Get scraped earnings from scraping agent"""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(f"{self.agents['scraping']}/scrape_earnings")
+                if response.status_code == 200:
+                    return response.json()["data"]
+                return []
+        except:
+            return []
+    
     async def retrieve_context(self, query: str) -> List[Dict]:
         """Retrieve relevant context from retriever agent"""
         try:
@@ -109,20 +149,45 @@ class MainOrchestrator:
         except:
             return []
     
-    async def synthesize_response(self, query: str, context: List[Dict], market_data: List[Dict]) -> Dict:
-        """Synthesize response using language agent"""
+    async def synthesize_response(self, query: str, context: List[Dict], market_data: List[Dict], 
+                                 news_data: List[Dict] = None, earnings_data: List[Dict] = None) -> Dict:
+        """Synthesize response using language agent with all data sources"""
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Prepare additional context from scraped data
+                additional_context = []
+                
+                if news_data:
+                    for news in news_data[:3]:  # Top 3 news items
+                        additional_context.append({
+                            "text": f"Latest News - {news.get('title', '')}: {news.get('source', '')}",
+                            "source": "scraped_news"
+                        })
+                
+                if earnings_data:
+                    for earnings in earnings_data[:3]:  # Top 3 earnings
+                        additional_context.append({
+                            "text": f"Earnings Update - {earnings.get('company', '')}: Expected {earnings.get('estimate', 0)}, Actual {earnings.get('actual', 0)}",
+                            "source": "scraped_earnings"
+                        })
+                
+                # Combine all context
+                all_context = context + additional_context
+                
                 response = await client.post(
                     f"{self.agents['language']}/synthesize",
                     json={
                         "query": query,
-                        "context_chunks": context,
+                        "context_chunks": all_context,
                         "market_data": market_data
                     }
                 )
                 if response.status_code == 200:
-                    return response.json()
+                    result = response.json()
+                    # Boost confidence if we have scraped data
+                    if news_data or earnings_data:
+                        result["confidence"] = min(0.95, result.get("confidence", 0.5) + 0.1)
+                    return result
                 return {"response": "Error generating response", "confidence": 0.0}
         except:
             return {"response": "Error connecting to language agent", "confidence": 0.0}
